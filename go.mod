@@ -1,4 +1,4 @@
-module github.com/caddyserver/replace-response
+module github.com/lemniskett/caddy-replace-response-once
 
 go 1.22.3
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package replaceresponse
+package replaceresponseonce
 
 import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -21,8 +21,8 @@ import (
 )
 
 func init() {
-	httpcaddyfile.RegisterHandlerDirective("replace", parseCaddyfile)
-	httpcaddyfile.RegisterDirectiveOrder("replace", httpcaddyfile.After, "encode")
+	httpcaddyfile.RegisterHandlerDirective("replace_once", parseCaddyfile)
+	httpcaddyfile.RegisterDirectiveOrder("replace_once", httpcaddyfile.After, "encode")
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Handler.
@@ -60,10 +60,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			return nil
 
-		case "re":
-			if !d.AllArgs(&repl.SearchRegexp, &repl.Replace) {
-				return d.ArgErr()
-			}
 		default:
 			if isBlock && d.Val() == "match" {
 				if h.Matcher != nil {
