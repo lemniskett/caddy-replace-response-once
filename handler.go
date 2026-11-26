@@ -21,15 +21,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strconv"
 	"sync"
-	"sync/atomic"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/icholy/replace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/text/transform"
@@ -39,8 +36,8 @@ func init() {
 	caddy.RegisterModule(Handler{})
 }
 
-// Handler manipulates response bodies by performing
-// substring or regex replacements.
+// Handler manipulates response bodies by replacing the first
+// occurrence of each search string.
 type Handler struct {
 	// The list of replacements to make on the response body.
 	Replacements []*Replacement `json:"replacements,omitempty"`
@@ -61,7 +58,7 @@ type Handler struct {
 // CaddyModule returns the Caddy module information.
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.replace_response",
+		ID:  "http.handlers.replace_response_once",
 		New: func() caddy.Module { return new(Handler) },
 	}
 }
@@ -77,7 +74,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// prepare each replacement
 	for i, repl := range h.Replacements {
 		if repl.Search == "" {
-			return fmt.Errorf("replacement %d: no search or search_regexp configured", i)
+			return fmt.Errorf("replacement %d: no search configured", i)
+		}
+		if len(repl.Search) > maxSearchSize {
+			return fmt.Errorf("replacement %d: search is longer than %d bytes", i, maxSearchSize)
 		}
 	}
 
@@ -179,34 +179,21 @@ func (h *Handler) makeTransformer(req *http.Request) transform.Transformer {
 
 	transforms := make([]transform.Transformer, len(h.Replacements))
 	for i, repl := range h.Replacements {
-		if repl.re != nil {
-			tr := replace.RegexpIndexFunc(repl.re, func(src []byte, index []int) []byte {
-				template := reqReplacer.ReplaceKnown(repl.Replace, "")
-				return repl.re.Expand(nil, []byte(template), src, index)
-			})
-			// See: https://github.com/icholy/replace/issues/5#issuecomment-949757616
-			tr.MaxMatchSize = 2048
-			transforms[i] = tr
-		} else {
-			transforms[i] = newReplaceOnce(
-				[]byte(reqReplacer.ReplaceKnown(repl.Search, "")),
-				[]byte(reqReplacer.ReplaceKnown(repl.Replace, "")),
-			)
-		}
+		transforms[i] = newReplaceOnce(
+			[]byte(reqReplacer.ReplaceKnown(repl.Search, "")),
+			[]byte(reqReplacer.ReplaceKnown(repl.Replace, "")),
+		)
 	}
 	return transform.Chain(transforms...)
 }
 
-// Replacement is either a substring or regular expression replacement
-// to perform; precisely one must be specified, not both.
+// Replacement replaces the first occurrence of a substring.
 type Replacement struct {
-	// A substring to search for. Mutually exclusive with search_regexp.
+	// The substring to search for. Required. Placeholders are expanded per request.
 	Search string `json:"search,omitempty"`
 
-	// The replacement string/value. Required.
+	// The replacement string/value. Placeholders are expanded per request.
 	Replace string `json:"replace"`
-
-	re *regexp.Regexp
 }
 
 // replaceWriter is used for streaming response body replacement. It
@@ -256,132 +243,89 @@ func (fw *replaceWriter) Close() error {
 	return nil
 }
 
-// replaceOnce is a transformer that replaces only the first occurrence of a substring.
+// maxSearchSize bounds a search string. Until the first match, the transformer
+// holds back up to len(search)-1 bytes between writes, and transform.Writer can
+// carry at most a few KB of unconsumed input.
+const maxSearchSize = 2048
+
+// replaceOnce is a transformer that replaces only the first occurrence of
+// search with replace. Each response gets its own instance.
+//
+// Until the match, it writes everything except the last len(search)-1 bytes and
+// returns ErrShortSrc, so the transform package hands those bytes back with the
+// next chunk and a match split across writes is still found. After the match, it
+// copies input through. It honors the size of dst everywhere, returning
+// ErrShortDst with the progress made, so the caller can continue.
 type replaceOnce struct {
-	search      []byte
-	replace     []byte
-	replaced    int32 // 1 if replaced, 0 otherwise. Use atomic for safe concurrent access.
-	searchIndex int
+	search  []byte
+	replace []byte
+	done    bool
+	// The part of replace not yet written because dst was full.
+	pending []byte
 }
 
 func newReplaceOnce(search, replace []byte) *replaceOnce {
-	return &replaceOnce{
-		search:  search,
-		replace: replace,
-	}
+	// A search that a placeholder expanded to nothing matches nothing.
+	return &replaceOnce{search: search, replace: replace, done: len(search) == 0}
 }
 
 func (r *replaceOnce) Transform(dst, src []byte, atEOF bool) (nDst, nSrc int, err error) {
-	if atomic.LoadInt32(&r.replaced) == 1 || len(r.search) == 0 {
-		// passthrough if already replaced or search is empty
-		n := copy(dst, src)
-		return n, n, nil
-	}
-
-	// Combine pending search buffer with new source
-	var searchBuffer []byte
-	if r.searchIndex > 0 {
-		searchBuffer = make([]byte, r.searchIndex+len(src))
-		copy(searchBuffer, r.search[:r.searchIndex])
-		copy(searchBuffer[r.searchIndex:], src)
-	} else {
-		searchBuffer = src
-	}
-
-	// Look for the search string
-	idx := bytes.Index(searchBuffer, r.search)
-
-	if idx != -1 {
-		// Found it.
-		if len(dst) < idx+len(r.replace) {
-			return 0, 0, transform.ErrShortDst
+	for {
+		if len(r.pending) > 0 {
+			n := copy(dst[nDst:], r.pending)
+			nDst += n
+			r.pending = r.pending[n:]
+			if len(r.pending) > 0 {
+				return nDst, nSrc, transform.ErrShortDst
+			}
 		}
 
-		// Copy bytes before the match
-		copy(dst, searchBuffer[:idx])
-		nDst += idx
-
-		// Copy replacement
-		copy(dst[nDst:], r.replace)
-		nDst += len(r.replace)
-
-		// Calculate how much of original src was consumed
-		// This is tricky because searchBuffer is a mix of old and new src
-		consumedInTotal := idx + len(r.search)
-		if consumedInTotal > r.searchIndex {
-			nSrc = consumedInTotal - r.searchIndex
-		} else {
-			// The entire match was within the previous partial match buffer.
-			// This case should be handled carefully, but for now we assume it doesn't happen
-			// if search buffer logic is correct.
-			nSrc = 0
+		rest := src[nSrc:]
+		if r.done {
+			n := copy(dst[nDst:], rest)
+			nDst += n
+			nSrc += n
+			if n < len(rest) {
+				return nDst, nSrc, transform.ErrShortDst
+			}
+			return nDst, nSrc, nil
 		}
 
-		atomic.StoreInt32(&r.replaced, 1)
-		r.searchIndex = 0 // reset partial match tracking
+		if i := bytes.Index(rest, r.search); i >= 0 {
+			n := copy(dst[nDst:], rest[:i])
+			nDst += n
+			nSrc += n
+			if n < i {
+				return nDst, nSrc, transform.ErrShortDst
+			}
+			nSrc += len(r.search)
+			r.done = true
+			r.pending = r.replace
+			continue
+		}
 
-		// Copy remaining part of src to dst
-		remainingSrc := src[nSrc:]
-		n := copy(dst[nDst:], remainingSrc)
+		// No match yet. Keep back a tail that may be the start of a match.
+		keep := 0
+		if !atEOF {
+			keep = min(len(r.search)-1, len(rest))
+		}
+		safe := len(rest) - keep
+		n := copy(dst[nDst:], rest[:safe])
 		nDst += n
 		nSrc += n
-
-		return nDst, nSrc, nil
-	}
-
-	// Not found. We might have a partial match at the end of src.
-	// We need to keep the part of src that could be a prefix of search.
-	// And write out the rest.
-
-	// The maximum overlap between the end of searchBuffer and the start of r.search
-	maxOverlap := 0
-	for i := 1; i < len(searchBuffer) && i < len(r.search); i++ {
-		if bytes.HasSuffix(searchBuffer, r.search[:i]) {
-			maxOverlap = i
+		if n < safe {
+			return nDst, nSrc, transform.ErrShortDst
 		}
-	}
-
-	if !atEOF && maxOverlap > 0 {
-		// We have a potential partial match at the end.
-		// Write out bytes before the potential partial match.
-		writeCount := len(searchBuffer) - maxOverlap
-		if writeCount > 0 {
-			if len(dst) < writeCount {
-				return 0, 0, transform.ErrShortDst
-			}
-			copy(dst, searchBuffer[:writeCount])
-			nDst = writeCount
+		if keep > 0 {
+			return nDst, nSrc, transform.ErrShortSrc
 		}
-
-		// Update searchIndex to reflect the new partial match state
-		r.searchIndex = maxOverlap
-
-		// Calculate nSrc. All of src has been processed and either written or buffered.
-		nSrc = len(src)
-
 		return nDst, nSrc, nil
 	}
-
-	// No full match, and no partial match at the end (or atEOF).
-	// Write everything out.
-	if len(dst) < len(searchBuffer) {
-		return 0, 0, transform.ErrShortDst
-	}
-	copy(dst, searchBuffer)
-	nDst = len(searchBuffer)
-	nSrc = len(src)
-	r.searchIndex = 0
-
-	if atEOF {
-		return nDst, nSrc, nil
-	}
-
-	return nDst, nSrc, nil
 }
 
 func (r *replaceOnce) Reset() {
-	atomic.StoreInt32(&r.replaced, 0)
-	r.searchIndex = 0
+	r.done = len(r.search) == 0
+	r.pending = nil
 }
 
 var bufPool = sync.Pool{

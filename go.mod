@@ -6,7 +6,6 @@ toolchain go1.24.4
 
 require (
 	github.com/caddyserver/caddy/v2 v2.9.1
-	github.com/icholy/replace v0.6.0
 	go.uber.org/zap v1.27.0
 	golang.org/x/text v0.21.0
 )

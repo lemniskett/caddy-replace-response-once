@@ -21,8 +21,8 @@ import (
 )
 
 func init() {
-	httpcaddyfile.RegisterHandlerDirective("replace_once", parseCaddyfile)
-	httpcaddyfile.RegisterDirectiveOrder("replace_once", httpcaddyfile.After, "encode")
+	httpcaddyfile.RegisterHandlerDirective("replace_response_once", parseCaddyfile)
+	httpcaddyfile.RegisterDirectiveOrder("replace_response_once", httpcaddyfile.After, "encode")
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Handler.
@@ -34,15 +34,15 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler. Syntax:
 //
-//	replace [stream | [re] <search> <replace>] {
+//	replace_response_once [stream | <search> <replace>] {
 //	    stream
 //		match {
 //			header Content-Type application/json*
 //		}
-//	    [re] <search> <replace>
+//	    <search> <replace>
 //	}
 //
-// If 're' is specified, the search string will be treated as a regular expression.
+// Only the first occurrence of each search string is replaced.
 // If 'stream' is specified, the replacement will happen without buffering the
 // whole response body; this might remove the Content-Length header.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
